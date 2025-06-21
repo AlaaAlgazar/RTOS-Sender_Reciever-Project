@@ -1,0 +1,280 @@
+#include "stm32f4xx.h"
+#include <FreeRTOS.h>
+#include <task.h>
+#include <queue.h>
+#include <semphr.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+
+#define QUEUE_LENGTH 200 
+
+/* ---------------------- Packet Definition ---------------------- */
+typedef struct {
+    uint8_t destination;
+    uint32_t sequence_number;
+    uint16_t length;
+    uint8_t sender_id;
+    uint8_t data[1000 - 1 - 4 - 2 - 1];
+} Packet;
+
+/* ---------------------- ACK Definition ---------------------- */
+typedef struct {
+    uint32_t sequence_number;
+    uint8_t sender_id;
+} Ack;
+
+/* ---------------------- System Resources ---------------------- */
+static QueueHandle_t switchQueue;
+static QueueHandle_t receiverQueues[2];
+static QueueHandle_t ackQueue;
+static SemaphoreHandle_t consoleMutex;
+static SemaphoreHandle_t seqNumMutex;
+static SemaphoreHandle_t statsMutex;
+
+static uint32_t global_seq_num = 0;
+static uint32_t global_received = 0;
+static uint32_t global_lost = 0;
+static volatile BaseType_t simulation_done = pdFALSE;
+
+static TickType_t start_time = 0;
+static TickType_t end_time = 0;
+
+#define P_ACK_DROP 10
+
+/* ---------------------- Safe Console Output ---------------------- */
+static void safe_printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    if (xSemaphoreTake(consoleMutex, portMAX_DELAY) == pdTRUE) {
+        vprintf(format, args);
+        xSemaphoreGive(consoleMutex);
+    }
+
+    va_end(args);
+}
+
+/* ---------------------- Sender Task ---------------------- */
+static void senderTask(void *param) {
+    uint8_t sender_id = (uint32_t)param;
+
+    while (1) {
+        if (simulation_done) {
+            vTaskSuspend(NULL);
+        }
+
+        Packet *pkt = (Packet *)pvPortMalloc(sizeof(Packet));
+        if (!pkt) {
+            safe_printf("Sender %d: malloc failed\n", sender_id);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        pkt->destination = (rand() % 2) + 3;
+
+        if (xSemaphoreTake(seqNumMutex, portMAX_DELAY) == pdTRUE) {
+            pkt->sequence_number = global_seq_num++;
+            xSemaphoreGive(seqNumMutex);
+        }
+
+        pkt->length = sizeof(Packet);
+        pkt->sender_id = sender_id;
+        memset(pkt->data, sender_id, sizeof(pkt->data));
+
+        int retries = 0;
+        BaseType_t ack_received = pdFALSE;
+
+        while (retries < 4) {
+            if (xQueueSend(switchQueue, &pkt, portMAX_DELAY) != pdPASS) {
+                safe_printf("Sender %d: switch queue send failed for packet %lu\n",
+                            sender_id, pkt->sequence_number);
+                break;
+            }
+
+            TickType_t wait_time = pdMS_TO_TICKS(500);
+            TickType_t start_wait = xTaskGetTickCount();
+
+            while ((xTaskGetTickCount() - start_wait) < wait_time) {
+                Ack ack;
+                if (xQueueReceive(ackQueue, &ack, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    if (ack.sequence_number == pkt->sequence_number &&
+                        ack.sender_id == sender_id) {
+                        ack_received = pdTRUE;
+                        break;
+                    }
+                }
+            }
+
+            if (ack_received) break;
+
+            retries++;
+            safe_printf("Sender %d: Retry #%d for packet %lu\n",
+                        sender_id, retries, pkt->sequence_number);
+        }
+
+        if (ack_received) {
+            safe_printf("Sender %d: ACK received for packet %lu\n",
+                        sender_id, pkt->sequence_number);
+        } else {
+            safe_printf("Sender %d: Dropping packet %lu after 4 attempts\n",
+                        sender_id, pkt->sequence_number);
+            if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
+                global_lost++;
+                xSemaphoreGive(statsMutex);
+            }
+        }
+
+        vPortFree(pkt);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+/* ---------------------- Receiver Task ---------------------- */
+static void receiverTask(void *param) {
+    uint8_t idx = (uint32_t)param;
+    Packet *pkt;
+
+    while (1) {
+        if (xQueueReceive(receiverQueues[idx], &pkt, portMAX_DELAY) == pdPASS) {
+            if (pkt->destination != (idx + 3)) {
+                continue;
+            }
+
+            if (xSemaphoreTake(statsMutex, portMAX_DELAY) == pdTRUE) {
+                if (global_received == 0) {
+                    start_time = xTaskGetTickCount();
+                }
+
+                global_received++;
+
+                safe_printf("Receiver %d: Packet #%lu | Received: %lu | Lost: %lu\n",
+                            idx + 3, pkt->sequence_number, global_received, global_lost);
+
+                if (global_received >= 2000 && !simulation_done) {
+                    simulation_done = pdTRUE;
+                    end_time = xTaskGetTickCount();
+                }
+
+                xSemaphoreGive(statsMutex);
+            }
+
+            if ((rand() % 1000) >= P_ACK_DROP) {
+                Ack ack = {
+                    .sequence_number = pkt->sequence_number,
+                    .sender_id = pkt->sender_id
+                };
+                xQueueSend(ackQueue, &ack, portMAX_DELAY);
+            } else {
+                safe_printf("Receiver %d: Dropped ACK for packet %lu\n", idx + 3, pkt->sequence_number);
+            }
+        }
+    }
+}
+
+/* ---------------------- Switch Task ---------------------- */
+static void switchTask(void *param) {
+    Packet *pkt;
+
+    while (1) {
+        if (xQueueReceive(switchQueue, &pkt, portMAX_DELAY) == pdPASS) {
+            if ((rand() % 1000) < 1) {
+                // Simulate packet loss at switch
+                continue;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(20));
+
+            uint8_t idx = pkt->destination - 3;
+            if (xQueueSend(receiverQueues[idx], &pkt, portMAX_DELAY) != pdPASS) {
+                // If send fails, drop packet silently
+                continue;
+            }
+        }
+    }
+}
+
+/* ---------------------- Monitor Task ---------------------- */
+static void monitorTask(void *param) {
+    (void)param;
+    while (!simulation_done) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    uint32_t duration_ms = (end_time - start_time) * portTICK_PERIOD_MS;
+
+    uint32_t throughput_bps = 0;
+    if (duration_ms > 0) {
+        throughput_bps = (2000 * sizeof(Packet) * 1000) / duration_ms;
+    }
+
+    safe_printf("\n===== Simulation Complete =====\n");
+    safe_printf("Total received packets: %lu\n", global_received);
+    safe_printf("Total lost packets: %lu\n", global_lost);
+    safe_printf("Time taken: %lu milliseconds\n", duration_ms);
+    safe_printf("Throughput: %lu bytes/sec\n", throughput_bps);
+    safe_printf("================================\n");
+
+    vTaskSuspend(NULL);
+}
+
+void prvSetupHardware(void) {
+    SystemCoreClockUpdate();
+
+#if (_FPU_PRESENT == 1) && (_FPU_USED == 1)
+    SCB->CPACR |= ((3UL << (10 * 2)) | (3UL << (11 * 2)));
+#endif
+
+    NVIC_SetPriorityGrouping(0);
+}
+
+void vApplicationMallocFailedHook(void) {
+    taskDISABLE_INTERRUPTS();
+    for (;;) {}
+}
+
+void vApplicationTickHook(void) {}
+
+void vApplicationIdleHook(void) {
+    __asm volatile("WFI");
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {
+    (void)xTask;
+    (void)pcTaskName;
+    taskDISABLE_INTERRUPTS();
+    for (;;) {}
+}
+
+int main(void) {
+    prvSetupHardware();
+    srand(1234);
+
+    consoleMutex = xSemaphoreCreateMutex();
+    seqNumMutex = xSemaphoreCreateMutex();
+    statsMutex = xSemaphoreCreateMutex();
+    if (!consoleMutex || !seqNumMutex || !statsMutex) {
+        while (1);
+    }
+
+    switchQueue = xQueueCreate(QUEUE_LENGTH, sizeof(Packet *));
+    receiverQueues[0] = xQueueCreate(QUEUE_LENGTH, sizeof(Packet *));
+    receiverQueues[1] = xQueueCreate(QUEUE_LENGTH, sizeof(Packet *));
+    ackQueue = xQueueCreate(QUEUE_LENGTH, sizeof(Ack));
+    if (!switchQueue || !receiverQueues[0] || !receiverQueues[1] || !ackQueue) {
+        while (1);
+    }
+
+    // Adjusted priorities here:
+    xTaskCreate(senderTask,    "Sender1",   configMINIMAL_STACK_SIZE * 4, (void *)1, 3, NULL);
+    xTaskCreate(senderTask,    "Sender2",   configMINIMAL_STACK_SIZE * 4, (void *)2, 3, NULL);
+    xTaskCreate(switchTask,    "Switch",    configMINIMAL_STACK_SIZE * 4, NULL,      5, NULL);
+    xTaskCreate(receiverTask,  "Receiver3", configMINIMAL_STACK_SIZE * 4, (void *)0, 4, NULL);
+    xTaskCreate(receiverTask,  "Receiver4", configMINIMAL_STACK_SIZE * 4, (void *)1, 4, NULL);
+    xTaskCreate(monitorTask,   "Monitor",   configMINIMAL_STACK_SIZE * 4, NULL,      1, NULL);
+
+    vTaskStartScheduler();
+    while (1);
+}
